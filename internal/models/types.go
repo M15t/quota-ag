@@ -69,3 +69,9 @@ type ModelQuota struct {
 	ResetTime    time.Time `json:"reset_time"`
 	ResetIn      string    `json:"reset_in,omitempty"` // Human-readable duration
 }
+
+// AccountCredential holds an account's email and access token
+type AccountCredential struct {
+	Email       string `json:"email"`
+	AccessToken string `json:"access_token"`
+}

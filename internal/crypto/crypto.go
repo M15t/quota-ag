@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/user"
 	"runtime"
+	"strings"
+	"sync"
 )
 
 // HashEmail creates a SHA256 hash of the email for use as filename
@@ -20,35 +22,54 @@ func HashEmail(email string) string {
 	return hex.EncodeToString(hash[:16])
 }
 
+// Cached machine key to avoid repeated syscalls and hashing
+var (
+	cachedMachineKey    []byte
+	cachedMachineKeyErr error
+	machineKeyOnce      sync.Once
+)
+
 // GetMachineKey derives an encryption key from machine-specific identifiers
+// The key is cached after first computation for performance.
 func GetMachineKey() ([]byte, error) {
+	machineKeyOnce.Do(func() {
+		cachedMachineKey, cachedMachineKeyErr = deriveMachineKey()
+	})
+	return cachedMachineKey, cachedMachineKeyErr
+}
+
+// deriveMachineKey performs the actual key derivation
+func deriveMachineKey() ([]byte, error) {
 	// Combine multiple machine identifiers for key derivation
-	var machineID string
+	var builder strings.Builder
 
 	// Get hostname
 	hostname, err := os.Hostname()
 	if err == nil {
-		machineID += hostname
+		builder.WriteString(hostname)
 	}
 
 	// Get current user
 	currentUser, err := user.Current()
 	if err == nil {
-		machineID += currentUser.Username + currentUser.Uid
+		builder.WriteString(currentUser.Username)
+		builder.WriteString(currentUser.Uid)
 	}
 
 	// Get home directory
 	homeDir, err := os.UserHomeDir()
 	if err == nil {
-		machineID += homeDir
+		builder.WriteString(homeDir)
 	}
 
 	// Add OS and arch for extra uniqueness
-	machineID += runtime.GOOS + runtime.GOARCH
+	builder.WriteString(runtime.GOOS)
+	builder.WriteString(runtime.GOARCH)
 
 	// Add a salt specific to this application
-	machineID += "quota-ag-v1-salt"
+	builder.WriteString("quota-ag-v1-salt")
 
+	machineID := builder.String()
 	if machineID == "" {
 		return nil, fmt.Errorf("failed to derive machine key: no identifiers available")
 	}

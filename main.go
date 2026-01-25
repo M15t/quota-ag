@@ -11,11 +11,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"quota-ag/internal/auth"
 	"quota-ag/internal/client"
+	"quota-ag/internal/display"
 	"quota-ag/internal/models"
 )
 
@@ -39,6 +41,7 @@ func main() {
 	account := flag.String("account", "", "Use specific account (email)")
 	allAccounts := flag.Bool("all", false, "Show quota for all accounts")
 	watch := flag.Duration("watch", 0, "Auto-refresh interval (e.g., 30s, 1m, 5m)")
+	clearScreen := flag.Bool("clear", false, "Clear screen before each refresh (use with --watch)")
 	flag.Parse()
 
 	ctx := context.Background()
@@ -85,7 +88,7 @@ func main() {
 	// Fetch and display quota
 	if *watch > 0 {
 		// Watch mode with auto-refresh
-		runWatchMode(ctx, oauth, *account, *allAccounts, *jsonOutput, *watch)
+		runWatchMode(ctx, oauth, *account, *allAccounts, *jsonOutput, *watch, *clearScreen)
 	} else if *allAccounts {
 		// Show quota for all accounts
 		showAllAccountsQuota(ctx, oauth, *jsonOutput)
@@ -98,8 +101,10 @@ func main() {
 func showSingleAccountQuota(ctx context.Context, oauth *auth.OAuthClient, email string, jsonOutput bool) {
 	// If no account specified, try to use first available or prompt for auth
 	if email == "" {
-		accounts, _ := oauth.ListAccounts()
-		if len(accounts) > 0 {
+		accounts, err := oauth.ListAccounts()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to list accounts: %v\n", err)
+		} else if len(accounts) > 0 {
 			email = accounts[0]
 		}
 	}
@@ -120,12 +125,12 @@ func showSingleAccountQuota(ctx context.Context, oauth *auth.OAuthClient, email 
 		quota.Email = userInfo.Email
 	}
 
-	sortModels(quota)
+	display.SortModels(quota)
 
 	if jsonOutput {
 		printJSON(quota)
 	} else {
-		printTable(quota)
+		display.PrintTable(quota)
 	}
 }
 
@@ -141,18 +146,47 @@ func showAllAccountsQuota(ctx context.Context, oauth *auth.OAuthClient, jsonOutp
 		return
 	}
 
-	var allQuotas []*models.QuotaStatus
+	// Fetch quotas in parallel for better performance
+	type quotaResult struct {
+		quota *models.QuotaStatus
+		email string
+		err   error
+	}
+
+	results := make(chan quotaResult, len(tokens))
+	var wg sync.WaitGroup
 
 	for _, t := range tokens {
-		quota, err := fetchQuotaForToken(ctx, t.AccessToken)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to fetch quota for %s: %v\n", t.Email, err)
+		wg.Add(1)
+		go func(token models.AccountCredential) {
+			defer wg.Done()
+			quota, err := fetchQuotaForToken(ctx, token.AccessToken)
+			results <- quotaResult{quota: quota, email: token.Email, err: err}
+		}(t)
+	}
+
+	// Close results channel when all goroutines complete
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collect results with pre-allocated slice
+	allQuotas := make([]*models.QuotaStatus, 0, len(tokens))
+	for r := range results {
+		if r.err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to fetch quota for %s: %v\n", r.email, r.err)
 			continue
 		}
-		quota.Email = t.Email
-		sortModels(quota)
-		allQuotas = append(allQuotas, quota)
+		r.quota.Email = r.email
+		display.SortModels(r.quota)
+		allQuotas = append(allQuotas, r.quota)
 	}
+
+	// Sort by email for consistent output order
+	sort.Slice(allQuotas, func(i, j int) bool {
+		return allQuotas[i].Email < allQuotas[j].Email
+	})
 
 	if jsonOutput {
 		printJSONAll(allQuotas)
@@ -161,7 +195,7 @@ func showAllAccountsQuota(ctx context.Context, oauth *auth.OAuthClient, jsonOutp
 			if i > 0 {
 				fmt.Println()
 			}
-			printTable(quota)
+			display.PrintTable(quota)
 		}
 	}
 }
@@ -171,84 +205,22 @@ func fetchQuotaForToken(ctx context.Context, accessToken string) (*models.QuotaS
 	return apiClient.FetchQuota(ctx)
 }
 
-func sortModels(quota *models.QuotaStatus) {
-	sort.Slice(quota.Models, func(i, j int) bool {
-		return quota.Models[i].Name < quota.Models[j].Name
-	})
-}
-
 func printJSON(quota *models.QuotaStatus) {
-	data, _ := json.MarshalIndent(quota, "", "  ")
+	data, err := json.MarshalIndent(quota, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error marshaling JSON: %v\n", err)
+		return
+	}
 	fmt.Println(string(data))
 }
 
 func printJSONAll(quotas []*models.QuotaStatus) {
-	data, _ := json.MarshalIndent(quotas, "", "  ")
-	fmt.Println(string(data))
-}
-
-func printTable(quota *models.QuotaStatus) {
-	if len(quota.Models) == 0 {
-		fmt.Println("No models found.")
+	data, err := json.MarshalIndent(quotas, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error marshaling JSON: %v\n", err)
 		return
 	}
-
-	// Header
-	fmt.Println()
-	fmt.Println("  Antigravity Quota Status")
-	if quota.Email != "" {
-		fmt.Printf("  Account: \033[36m%s\033[0m\n", quota.Email[:5]+"..."+strings.Split(quota.Email, "@")[1])
-	}
-	fmt.Println("  " + strings.Repeat("━", 60))
-	fmt.Printf("  %-30s %17s %10s\n", "Model", "Remaining", "Reset In")
-	fmt.Println("  " + strings.Repeat("─", 60))
-
-	// Rows
-	for _, m := range quota.Models {
-		if m.Name == "" {
-			continue
-		}
-		bar := progressBar(m.RemainingPct, 10)
-		color := getColor(m.RemainingPct)
-		reset := "\033[0m"
-
-		fmt.Printf("  %-30s %s%s %5.1f%%%s %10s\n",
-			truncate(m.Name, 30),
-			color, bar, m.RemainingPct, reset,
-			m.ResetIn,
-		)
-	}
-
-	fmt.Println("  " + strings.Repeat("━", 60))
-}
-
-func progressBar(pct float64, width int) string {
-	filled := int(pct / 100 * float64(width))
-	if filled > width {
-		filled = width
-	}
-	if filled < 0 {
-		filled = 0
-	}
-
-	bar := strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
-	return bar
-}
-
-func getColor(pct float64) string {
-	if pct <= 10 {
-		return "\033[31m" // Red
-	} else if pct <= 30 {
-		return "\033[33m" // Yellow
-	}
-	return "\033[32m" // Green
-}
-
-func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen-3] + "..."
+	fmt.Println(string(data))
 }
 
 func showRemoveHelp() {
@@ -295,7 +267,7 @@ func showRemoveHelp() {
 	fmt.Printf("Removed account: %s\n", email)
 }
 
-func runWatchMode(ctx context.Context, oauth *auth.OAuthClient, account string, allAccounts bool, jsonOutput bool, interval time.Duration) {
+func runWatchMode(ctx context.Context, oauth *auth.OAuthClient, account string, allAccounts bool, jsonOutput bool, interval time.Duration, doClear bool) {
 	// Setup signal handling for graceful exit
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -304,7 +276,9 @@ func runWatchMode(ctx context.Context, oauth *auth.OAuthClient, account string, 
 	defer ticker.Stop()
 
 	// Initial display
-	clearScreen()
+	if doClear {
+		display.ClearScreen()
+	}
 	displayQuota(ctx, oauth, account, allAccounts, jsonOutput, interval)
 
 	for {
@@ -313,14 +287,12 @@ func runWatchMode(ctx context.Context, oauth *auth.OAuthClient, account string, 
 			fmt.Println("\n\nStopping watch mode...")
 			return
 		case <-ticker.C:
-			clearScreen()
+			if doClear {
+				display.ClearScreen()
+			}
 			displayQuota(ctx, oauth, account, allAccounts, jsonOutput, interval)
 		}
 	}
-}
-
-func clearScreen() {
-	fmt.Print("\033[H\033[2J")
 }
 
 func displayQuota(ctx context.Context, oauth *auth.OAuthClient, account string, allAccounts bool, jsonOutput bool, interval time.Duration) {
@@ -339,8 +311,10 @@ func displayQuota(ctx context.Context, oauth *auth.OAuthClient, account string, 
 
 func showSingleAccountQuotaSilent(ctx context.Context, oauth *auth.OAuthClient, email string, jsonOutput bool) {
 	if email == "" {
-		accounts, _ := oauth.ListAccounts()
-		if len(accounts) > 0 {
+		accounts, err := oauth.ListAccounts()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to list accounts: %v\n", err)
+		} else if len(accounts) > 0 {
 			email = accounts[0]
 		}
 	}
@@ -361,12 +335,12 @@ func showSingleAccountQuotaSilent(ctx context.Context, oauth *auth.OAuthClient, 
 		quota.Email = userInfo.Email
 	}
 
-	sortModels(quota)
+	display.SortModels(quota)
 
 	if jsonOutput {
 		printJSON(quota)
 	} else {
-		printTable(quota)
+		display.PrintTable(quota)
 	}
 }
 
@@ -382,18 +356,47 @@ func showAllAccountsQuotaSilent(ctx context.Context, oauth *auth.OAuthClient, js
 		return
 	}
 
-	var allQuotas []*models.QuotaStatus
+	// Fetch quotas in parallel for better performance
+	type quotaResult struct {
+		quota *models.QuotaStatus
+		email string
+		err   error
+	}
+
+	results := make(chan quotaResult, len(tokens))
+	var wg sync.WaitGroup
 
 	for _, t := range tokens {
-		quota, err := fetchQuotaForToken(ctx, t.AccessToken)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to fetch quota for %s: %v\n", t.Email, err)
+		wg.Add(1)
+		go func(token models.AccountCredential) {
+			defer wg.Done()
+			quota, err := fetchQuotaForToken(ctx, token.AccessToken)
+			results <- quotaResult{quota: quota, email: token.Email, err: err}
+		}(t)
+	}
+
+	// Close results channel when all goroutines complete
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collect results with pre-allocated slice
+	allQuotas := make([]*models.QuotaStatus, 0, len(tokens))
+	for r := range results {
+		if r.err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to fetch quota for %s: %v\n", r.email, r.err)
 			continue
 		}
-		quota.Email = t.Email
-		sortModels(quota)
-		allQuotas = append(allQuotas, quota)
+		r.quota.Email = r.email
+		display.SortModels(r.quota)
+		allQuotas = append(allQuotas, r.quota)
 	}
+
+	// Sort by email for consistent output order
+	sort.Slice(allQuotas, func(i, j int) bool {
+		return allQuotas[i].Email < allQuotas[j].Email
+	})
 
 	if jsonOutput {
 		printJSONAll(allQuotas)
@@ -402,7 +405,7 @@ func showAllAccountsQuotaSilent(ctx context.Context, oauth *auth.OAuthClient, js
 			if i > 0 {
 				fmt.Println()
 			}
-			printTable(quota)
+			display.PrintTable(quota)
 		}
 	}
 }

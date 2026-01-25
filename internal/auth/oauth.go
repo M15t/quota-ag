@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +16,7 @@ import (
 	"time"
 
 	"quota-ag/internal/crypto"
+	"quota-ag/internal/models"
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
@@ -34,6 +37,16 @@ var (
 		"https://www.googleapis.com/auth/userinfo.profile",
 		"https://www.googleapis.com/auth/cclog",
 		"https://www.googleapis.com/auth/experimentsandconfigs",
+	}
+
+	// Shared HTTP client for userinfo requests (connection reuse)
+	userInfoClient = &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        10,
+			MaxIdleConnsPerHost: 5,
+			IdleConnTimeout:     90 * time.Second,
+		},
 	}
 )
 
@@ -218,19 +231,13 @@ func (c *OAuthClient) GetAccessToken(ctx context.Context, email string, forceRea
 }
 
 // GetAllAccountTokens returns access tokens for all stored accounts
-func (c *OAuthClient) GetAllAccountTokens(ctx context.Context) ([]struct {
-	Email       string
-	AccessToken string
-}, error) {
+func (c *OAuthClient) GetAllAccountTokens(ctx context.Context) ([]models.AccountCredential, error) {
 	accounts, err := c.ListAccounts()
 	if err != nil {
 		return nil, err
 	}
 
-	var results []struct {
-		Email       string
-		AccessToken string
-	}
+	results := make([]models.AccountCredential, 0, len(accounts))
 
 	for _, email := range accounts {
 		accessToken, _, err := c.GetAccessToken(ctx, email, false)
@@ -238,10 +245,10 @@ func (c *OAuthClient) GetAllAccountTokens(ctx context.Context) ([]struct {
 			fmt.Fprintf(os.Stderr, "Warning: failed to get token for %s: %v\n", email, err)
 			continue
 		}
-		results = append(results, struct {
-			Email       string
-			AccessToken string
-		}{Email: email, AccessToken: accessToken})
+		results = append(results, models.AccountCredential{
+			Email:       email,
+			AccessToken: accessToken,
+		})
 	}
 
 	return results, nil
@@ -249,8 +256,12 @@ func (c *OAuthClient) GetAllAccountTokens(ctx context.Context) ([]struct {
 
 // authenticate performs the OAuth flow
 func (c *OAuthClient) authenticate(ctx context.Context) (*oauth2.Token, error) {
-	// Generate state for CSRF protection
-	state := fmt.Sprintf("%d", time.Now().UnixNano())
+	// Generate cryptographically secure state for CSRF protection
+	stateBytes := make([]byte, 32)
+	if _, err := rand.Read(stateBytes); err != nil {
+		return nil, fmt.Errorf("failed to generate state: %w", err)
+	}
+	state := base64.URLEncoding.EncodeToString(stateBytes)
 
 	// Channel to receive the authorization code
 	codeChan := make(chan string, 1)
@@ -259,8 +270,11 @@ func (c *OAuthClient) authenticate(ctx context.Context) (*oauth2.Token, error) {
 	// Create a new ServeMux to avoid handler conflicts
 	mux := http.NewServeMux()
 	server := &http.Server{
-		Addr:    fmt.Sprintf(":%d", callbackPort),
-		Handler: mux,
+		Addr:         fmt.Sprintf("127.0.0.1:%d", callbackPort), // Bind to localhost only
+		Handler:      mux,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  30 * time.Second,
 	}
 
 	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
@@ -424,8 +438,7 @@ func (c *OAuthClient) GetUserInfo(ctx context.Context, accessToken string) (*Use
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := userInfoClient.Do(req) // Use shared client for connection reuse
 	if err != nil {
 		return nil, err
 	}

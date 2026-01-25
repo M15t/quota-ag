@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"time"
 
@@ -18,6 +19,13 @@ const (
 	maxRetries = 3
 )
 
+// Shared HTTP transport for connection pooling across clients
+var sharedTransport = &http.Transport{
+	MaxIdleConns:        100,
+	MaxIdleConnsPerHost: 10,
+	IdleConnTimeout:     90 * time.Second,
+}
+
 // CloudCodeClient handles API calls to Google Cloud Code
 type CloudCodeClient struct {
 	httpClient  *http.Client
@@ -29,7 +37,8 @@ type CloudCodeClient struct {
 func NewCloudCodeClient(accessToken string) *CloudCodeClient {
 	return &CloudCodeClient{
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout:   30 * time.Second,
+			Transport: sharedTransport,
 		},
 		accessToken: accessToken,
 	}
@@ -134,8 +143,10 @@ func (c *CloudCodeClient) doRequest(ctx context.Context, path string, body inter
 	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if attempt > 0 {
-			// Exponential backoff
-			time.Sleep(time.Duration(1<<attempt) * time.Second)
+			// Exponential backoff with jitter to prevent thundering herd
+			backoff := time.Duration(1<<attempt) * time.Second
+			jitter := time.Duration(rand.Int63n(int64(backoff / 2)))
+			time.Sleep(backoff + jitter)
 		}
 
 		req, err := http.NewRequestWithContext(ctx, "POST", baseURL+path, bytes.NewReader(jsonBody))
@@ -152,9 +163,9 @@ func (c *CloudCodeClient) doRequest(ctx context.Context, path string, body inter
 			lastErr = err
 			continue
 		}
-		defer resp.Body.Close()
 
 		respBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close() // Close immediately, not deferred (avoid resource leak in loop)
 		if err != nil {
 			lastErr = err
 			continue

@@ -58,8 +58,10 @@ type QuotaInfo struct {
 
 // Parsed quota data for display
 type QuotaStatus struct {
-	Email  string       `json:"email,omitempty"`
-	Models []ModelQuota `json:"models"`
+	Email        string       `json:"email,omitempty"`
+	Tier         string       `json:"tier,omitempty"`          // Current tier (FREE, PRO, ULTRA)
+	AllowedTiers []string     `json:"allowed_tiers,omitempty"` // Available tiers for this account
+	Models       []ModelQuota `json:"models"`
 }
 
 type ModelQuota struct {

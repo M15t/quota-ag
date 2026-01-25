@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"net/http"
 	"time"
@@ -44,12 +45,34 @@ func NewCloudCodeClient(accessToken string) *CloudCodeClient {
 	}
 }
 
+// projectInfo holds project metadata including tier information
+type projectInfo struct {
+	ProjectID    string
+	CurrentTier  string
+	AllowedTiers []string
+}
+
+// Known tier IDs for validation (as returned by Google API)
+var knownTiers = map[string]bool{
+	"free-tier":     true,
+	"standard-tier": true,
+	"pro-tier":      true,
+	"ultra-tier":    true,
+	// Uppercase variants in case API changes
+	"FREE":     true,
+	"STANDARD": true,
+	"PRO":      true,
+	"ULTRA":    true,
+}
+
 // FetchQuota fetches the quota information for all models
 func (c *CloudCodeClient) FetchQuota(ctx context.Context) (*models.QuotaStatus, error) {
-	// First, get the project ID
-	if err := c.loadProjectInfo(ctx); err != nil {
+	// First, get the project ID and tier info
+	info, err := c.loadProjectInfo(ctx)
+	if err != nil {
 		return nil, fmt.Errorf("failed to load project info: %w", err)
 	}
+	c.projectID = info.ProjectID
 
 	// Then fetch available models with quota
 	modelsResp, err := c.fetchAvailableModels(ctx)
@@ -59,7 +82,9 @@ func (c *CloudCodeClient) FetchQuota(ctx context.Context) (*models.QuotaStatus, 
 
 	// Convert to QuotaStatus
 	status := &models.QuotaStatus{
-		Models: make([]models.ModelQuota, 0, len(modelsResp.Models)),
+		Tier:         info.CurrentTier,
+		AllowedTiers: info.AllowedTiers,
+		Models:       make([]models.ModelQuota, 0, len(modelsResp.Models)),
 	}
 
 	for _, model := range modelsResp.Models {
@@ -78,8 +103,8 @@ func (c *CloudCodeClient) FetchQuota(ctx context.Context) (*models.QuotaStatus, 
 	return status, nil
 }
 
-// loadProjectInfo calls loadCodeAssist to get the project ID
-func (c *CloudCodeClient) loadProjectInfo(ctx context.Context) error {
+// loadProjectInfo calls loadCodeAssist to get the project ID and tier info
+func (c *CloudCodeClient) loadProjectInfo(ctx context.Context) (*projectInfo, error) {
 	reqBody := models.LoadCodeAssistRequest{
 		Metadata: models.CloudCodeMetadata{
 			IdeType:    "ANTIGRAVITY",
@@ -90,12 +115,30 @@ func (c *CloudCodeClient) loadProjectInfo(ctx context.Context) error {
 
 	var resp models.LoadCodeAssistResponse
 	if err := c.doRequest(ctx, "/v1internal:loadCodeAssist", reqBody, &resp); err != nil {
-		return err
+		return nil, err
 	}
 
-	// Extract project ID from response
-	c.projectID = extractProjectID(resp.CloudAICompanionProject)
-	return nil
+	info := &projectInfo{
+		ProjectID: extractProjectID(resp.CloudAICompanionProject),
+	}
+
+	// Extract current tier
+	if resp.CurrentTier != nil && resp.CurrentTier.ID != "" {
+		tier := resp.CurrentTier.ID
+		if !knownTiers[tier] {
+			log.Printf("Warning: unknown tier '%s' returned by API", tier)
+		}
+		info.CurrentTier = tier
+	}
+
+	// Extract allowed tiers
+	for _, tier := range resp.AllowedTiers {
+		if tier.ID != "" {
+			info.AllowedTiers = append(info.AllowedTiers, tier.ID)
+		}
+	}
+
+	return info, nil
 }
 
 // extractProjectID extracts the project ID from the cloudaicompanionProject field

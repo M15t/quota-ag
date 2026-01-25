@@ -14,6 +14,9 @@ const (
 	Reset  = "\033[0m"
 	Bold   = "\033[1m"
 	Dim    = "\033[90m"
+	White  = "\033[37m"
+	Blue   = "\033[34m"
+	Purple = "\033[35m" // Magenta
 	Cyan   = "\033[36m"
 	Yellow = "\033[33m"
 	Green  = "\033[32m"
@@ -129,6 +132,50 @@ func GetProviderIcon(provider string) string {
 	}
 }
 
+// GetTierColor returns the ANSI color code for a tier
+func GetTierColor(tier string) string {
+	tierUpper := strings.ToUpper(tier)
+	switch {
+	case strings.Contains(tierUpper, "ULTRA"):
+		return Purple
+	case strings.Contains(tierUpper, "PRO"):
+		return Blue
+	case strings.Contains(tierUpper, "STANDARD"):
+		return Cyan
+	case strings.Contains(tierUpper, "FREE"):
+		return White
+	default:
+		return Dim // Unknown tier
+	}
+}
+
+// GetTierDisplayName returns a clean display name for a tier
+func GetTierDisplayName(tier string) string {
+	tierUpper := strings.ToUpper(tier)
+	switch {
+	case strings.Contains(tierUpper, "ULTRA"):
+		return "ULTRA"
+	case strings.Contains(tierUpper, "PRO"):
+		return "PRO"
+	case strings.Contains(tierUpper, "STANDARD"):
+		return "STANDARD"
+	case strings.Contains(tierUpper, "FREE"):
+		return "FREE"
+	default:
+		return strings.ToUpper(tier) // Show as-is for unknown
+	}
+}
+
+// GetTierDisplay returns a formatted tier badge for display
+func GetTierDisplay(tier string) string {
+	if tier == "" {
+		return ""
+	}
+	displayName := GetTierDisplayName(tier)
+	color := GetTierColor(tier)
+	return fmt.Sprintf("%s[%s]%s", color, displayName, Reset)
+}
+
 // ProgressBar creates a fancy progress bar with colors
 func ProgressBar(pct float64, width int) string {
 	filled := int(pct / 100 * float64(width))
@@ -212,7 +259,11 @@ func PrintTable(quota *models.QuotaStatus) {
 	fmt.Println()
 	fmt.Println("  " + Bold + Cyan + "ANTIGRAVITY QUOTA DASHBOARD" + Reset)
 	if quota.Email != "" {
-		fmt.Println("  " + Dim + MaskEmail(quota.Email) + Reset)
+		tierDisplay := ""
+		if quota.Tier != "" {
+			tierDisplay = " " + GetTierDisplay(quota.Tier)
+		}
+		fmt.Println("  " + Dim + MaskEmail(quota.Email) + Reset + tierDisplay)
 	}
 	fmt.Println()
 

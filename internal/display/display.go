@@ -3,8 +3,11 @@ package display
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"strings"
+
+	"golang.org/x/term"
 
 	"quota-ag/internal/models"
 )
@@ -138,7 +141,7 @@ func GetTierColor(tier string) string {
 	switch {
 	case strings.Contains(tierUpper, "ULTRA"):
 		return Purple
-	case strings.Contains(tierUpper, "PRO"):
+	case strings.Contains(tierUpper, "PRO"), strings.Contains(tierUpper, "G1-PRO"):
 		return Blue
 	case strings.Contains(tierUpper, "STANDARD"):
 		return Cyan
@@ -151,15 +154,15 @@ func GetTierColor(tier string) string {
 
 // GetTierDisplayName returns a clean display name for a tier
 func GetTierDisplayName(tier string) string {
-	tierUpper := strings.ToUpper(tier)
+	tierLower := strings.ToLower(tier)
 	switch {
-	case strings.Contains(tierUpper, "ULTRA"):
+	case strings.Contains(tierLower, "g1-ultra"), strings.Contains(tierLower, "ultra"):
 		return "ULTRA"
-	case strings.Contains(tierUpper, "PRO"):
+	case strings.Contains(tierLower, "g1-pro"), strings.Contains(tierLower, "pro"):
 		return "PRO"
-	case strings.Contains(tierUpper, "STANDARD"):
+	case strings.Contains(tierLower, "standard"):
 		return "STANDARD"
-	case strings.Contains(tierUpper, "FREE"):
+	case strings.Contains(tierLower, "free"):
 		return "FREE"
 	default:
 		return strings.ToUpper(tier) // Show as-is for unknown
@@ -340,4 +343,272 @@ func PrintTable(quota *models.QuotaStatus) {
 // ClearScreen clears the terminal screen
 func ClearScreen() {
 	fmt.Print("\033[H\033[2J")
+}
+
+// Column layout constants
+const (
+	SingleColumnWidth = 66  // Minimum width for single column
+	DoubleColumnWidth = 140 // Minimum width for double column layout
+	ColumnWidth       = 68  // Width of each column in double layout
+)
+
+// GetTerminalWidth returns the current terminal width, or a default if unavailable
+func GetTerminalWidth() int {
+	width, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil || width <= 0 {
+		return 80 // Default fallback
+	}
+	return width
+}
+
+// CanUseDoubleColumn returns true if terminal is wide enough for 2 columns
+func CanUseDoubleColumn() bool {
+	return GetTerminalWidth() >= DoubleColumnWidth
+}
+
+// RenderTableToLines renders a quota table to a slice of strings (for column layout)
+func RenderTableToLines(quota *models.QuotaStatus, width int) []string {
+	var lines []string
+
+	if len(quota.Models) == 0 {
+		lines = append(lines, "No models found.")
+		return lines
+	}
+
+	// Calculate summary stats
+	var lowQuota, criticalQuota int
+	for _, m := range quota.Models {
+		if m.ResetIn == "expired" {
+			continue
+		}
+		if m.RemainingPct <= 10 {
+			criticalQuota++
+		} else if m.RemainingPct <= 30 {
+			lowQuota++
+		}
+	}
+
+	// Header
+	lines = append(lines, "")
+	lines = append(lines, "  "+Bold+Cyan+"QUOTA DASHBOARD"+Reset)
+	if quota.Email != "" {
+		tierDisplay := ""
+		if quota.Tier != "" {
+			tierDisplay = " " + GetTierDisplay(quota.Tier)
+		}
+		lines = append(lines, "  "+Dim+MaskEmail(quota.Email)+Reset+tierDisplay)
+	}
+	lines = append(lines, "")
+
+	// Summary line
+	summary := fmt.Sprintf("  %s%d models%s", Dim, len(quota.Models), Reset)
+	if criticalQuota > 0 {
+		summary += fmt.Sprintf("  %s● %d critical%s", Red, criticalQuota, Reset)
+	}
+	if lowQuota > 0 {
+		summary += fmt.Sprintf("  %s● %d low%s", Yellow, lowQuota, Reset)
+	}
+	lines = append(lines, summary)
+	lines = append(lines, "  "+Dim+strings.Repeat("─", width-4)+Reset)
+
+	// Group models by provider
+	groups := GroupModelsByProvider(quota.Models)
+
+	for _, provider := range providerOrder {
+		providerModels, exists := groups[provider]
+		if !exists || len(providerModels) == 0 {
+			continue
+		}
+
+		// Provider header
+		providerIcon := GetProviderIcon(provider)
+		lines = append(lines, "")
+		lines = append(lines, fmt.Sprintf("  %s%s %s%s", Bold, providerIcon, provider, Reset))
+
+		// Models in this group
+		for _, m := range providerModels {
+			if m.ResetIn == "expired" {
+				continue
+			}
+			bar := ProgressBar(m.RemainingPct, 10)
+			color := GetColor(m.RemainingPct)
+
+			displayName := strings.TrimPrefix(m.Name, "Gemini ")
+			displayName = strings.TrimPrefix(displayName, "Claude ")
+			displayName = strings.TrimPrefix(displayName, "GPT-")
+			displayName = Truncate(displayName, 22)
+
+			line := fmt.Sprintf("    %-22s %s %s%5.1f%%%s %s%s%s",
+				displayName,
+				bar,
+				color, m.RemainingPct, Reset,
+				Dim, m.ResetIn, Reset)
+			lines = append(lines, line)
+		}
+	}
+
+	lines = append(lines, "")
+	return lines
+}
+
+// PrintTablesSideBySide prints two quota tables side by side
+func PrintTablesSideBySide(left, right *models.QuotaStatus) {
+	PrintTablesInColumns([]*models.QuotaStatus{left, right})
+}
+
+// GetColumnCount returns the number of columns that fit in the terminal
+func GetColumnCount() int {
+	width := GetTerminalWidth()
+	// Each column needs ColumnWidth + 3 for separator " │ "
+	// First column doesn't need separator
+	if width < ColumnWidth {
+		return 1
+	}
+	// Calculate: ColumnWidth + (n-1) * (ColumnWidth + 3) <= width
+	// Simplify: n * ColumnWidth + (n-1) * 3 <= width
+	cols := 1
+	for {
+		neededWidth := cols*ColumnWidth + (cols-1)*3
+		if neededWidth > width {
+			break
+		}
+		cols++
+	}
+	return cols - 1
+}
+
+// PrintTablesInColumns prints quota tables in N columns based on terminal width
+func PrintTablesInColumns(quotas []*models.QuotaStatus) {
+	if len(quotas) == 0 {
+		return
+	}
+
+	numCols := GetColumnCount()
+	if numCols < 1 {
+		numCols = 1
+	}
+	if numCols > len(quotas) {
+		numCols = len(quotas)
+	}
+
+	// Render all quotas to lines
+	allLines := make([][]string, len(quotas))
+	for i, q := range quotas {
+		allLines[i] = RenderTableToLines(q, ColumnWidth)
+	}
+
+	// Process in rows of numCols
+	for rowStart := 0; rowStart < len(quotas); rowStart += numCols {
+		if rowStart > 0 {
+			fmt.Println()
+		}
+
+		rowEnd := rowStart + numCols
+		if rowEnd > len(quotas) {
+			rowEnd = len(quotas)
+		}
+
+		// Get lines for this row of quotas
+		rowLines := allLines[rowStart:rowEnd]
+
+		// Find max lines in this row
+		maxLines := 0
+		for _, lines := range rowLines {
+			if len(lines) > maxLines {
+				maxLines = len(lines)
+			}
+		}
+
+		// Pad all to same length
+		for i := range rowLines {
+			for len(rowLines[i]) < maxLines {
+				rowLines[i] = append(rowLines[i], "")
+			}
+		}
+
+		// Print row by row
+		for lineIdx := 0; lineIdx < maxLines; lineIdx++ {
+			for colIdx, lines := range rowLines {
+				if colIdx > 0 {
+					fmt.Print(" │ ")
+				}
+				fmt.Print(padToWidth(lines[lineIdx], ColumnWidth))
+			}
+			fmt.Println()
+		}
+	}
+}
+
+// PrintMultipleQuotas prints quotas in columns if terminal is wide enough
+func PrintMultipleQuotas(quotas []*models.QuotaStatus) {
+	if len(quotas) == 0 {
+		return
+	}
+
+	// Single quota - use standard PrintTable
+	if len(quotas) == 1 {
+		PrintTable(quotas[0])
+		return
+	}
+
+	// Use dynamic column layout
+	numCols := GetColumnCount()
+	if numCols >= 2 {
+		PrintTablesInColumns(quotas)
+	} else {
+		// Fallback to stacked layout
+		for i, quota := range quotas {
+			if i > 0 {
+				fmt.Println()
+			}
+			PrintTable(quota)
+		}
+	}
+}
+
+// stripANSI removes ANSI escape codes from a string for length calculation
+func stripANSI(s string) string {
+	result := s
+	for {
+		start := strings.Index(result, "\033[")
+		if start == -1 {
+			break
+		}
+		end := strings.IndexByte(result[start:], 'm')
+		if end == -1 {
+			break
+		}
+		result = result[:start] + result[start+end+1:]
+	}
+	return result
+}
+
+// visibleWidth calculates the visible width of a string (excluding ANSI codes)
+// This counts Unicode runes properly
+func visibleWidth(s string) int {
+	stripped := stripANSI(s)
+	// Count runes, not bytes
+	count := 0
+	for range stripped {
+		count++
+	}
+	return count
+}
+
+// padToWidth pads a string (with ANSI codes) to a target visible width
+func padToWidth(s string, targetWidth int) string {
+	currentWidth := visibleWidth(s)
+	if currentWidth >= targetWidth {
+		return s
+	}
+	return s + strings.Repeat(" ", targetWidth-currentWidth)
+}
+
+// padRight pads a string with ANSI codes to a visual width
+func padRight(stripped, original string, width int) string {
+	visibleLen := len(stripped)
+	if visibleLen >= width {
+		return original
+	}
+	return original + strings.Repeat(" ", width-visibleLen)
 }

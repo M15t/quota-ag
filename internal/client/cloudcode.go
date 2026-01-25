@@ -54,15 +54,15 @@ type projectInfo struct {
 
 // Known tier IDs for validation (as returned by Google API)
 var knownTiers = map[string]bool{
+	// Free/Standard tiers
 	"free-tier":     true,
 	"standard-tier": true,
-	"pro-tier":      true,
-	"ultra-tier":    true,
-	// Uppercase variants in case API changes
-	"FREE":     true,
-	"STANDARD": true,
-	"PRO":      true,
-	"ULTRA":    true,
+	// Google One subscription tiers
+	"g1-pro-tier":   true,
+	"g1-ultra-tier": true,
+	// Legacy tier names
+	"pro-tier":   true,
+	"ultra-tier": true,
 }
 
 // FetchQuota fetches the quota information for all models
@@ -122,8 +122,15 @@ func (c *CloudCodeClient) loadProjectInfo(ctx context.Context) (*projectInfo, er
 		ProjectID: extractProjectID(resp.CloudAICompanionProject),
 	}
 
-	// Extract current tier
-	if resp.CurrentTier != nil && resp.CurrentTier.ID != "" {
+	// Extract tier - prefer paidTier (subscription level) over currentTier
+	if resp.PaidTier != nil && resp.PaidTier.ID != "" {
+		tier := resp.PaidTier.ID
+		if !knownTiers[tier] {
+			log.Printf("Warning: unknown paid tier '%s' returned by API", tier)
+		}
+		info.CurrentTier = tier
+	} else if resp.CurrentTier != nil && resp.CurrentTier.ID != "" {
+		// Fallback to currentTier if no paidTier
 		tier := resp.CurrentTier.ID
 		if !knownTiers[tier] {
 			log.Printf("Warning: unknown tier '%s' returned by API", tier)

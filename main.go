@@ -41,7 +41,7 @@ func main() {
 	account := flag.String("account", "", "Use specific account (email)")
 	allAccounts := flag.Bool("all", false, "Show quota for all accounts")
 	watch := flag.Duration("watch", 0, "Auto-refresh interval (e.g., 30s, 1m, 5m)")
-	clearScreen := flag.Bool("clear", false, "Clear screen before each refresh (use with --watch)")
+	noClear := flag.Bool("no-clear", false, "Don't clear screen before each refresh (use with --watch)")
 	flag.Parse()
 
 	ctx := context.Background()
@@ -87,8 +87,9 @@ func main() {
 
 	// Fetch and display quota
 	if *watch > 0 {
-		// Watch mode with auto-refresh
-		runWatchMode(ctx, oauth, *account, *allAccounts, *jsonOutput, *watch, *clearScreen)
+		// Watch mode with auto-refresh (clear screen by default)
+		doClear := !*noClear
+		runWatchMode(ctx, oauth, *account, *allAccounts, *jsonOutput, *watch, doClear)
 	} else if *allAccounts {
 		// Show quota for all accounts
 		showAllAccountsQuota(ctx, oauth, *jsonOutput)
@@ -191,12 +192,7 @@ func showAllAccountsQuota(ctx context.Context, oauth *auth.OAuthClient, jsonOutp
 	if jsonOutput {
 		printJSONAll(allQuotas)
 	} else {
-		for i, quota := range allQuotas {
-			if i > 0 {
-				fmt.Println()
-			}
-			display.PrintTable(quota)
-		}
+		display.PrintMultipleQuotas(allQuotas)
 	}
 }
 
@@ -401,11 +397,6 @@ func showAllAccountsQuotaSilent(ctx context.Context, oauth *auth.OAuthClient, js
 	if jsonOutput {
 		printJSONAll(allQuotas)
 	} else {
-		for i, quota := range allQuotas {
-			if i > 0 {
-				fmt.Println()
-			}
-			display.PrintTable(quota)
-		}
+		display.PrintMultipleQuotas(allQuotas)
 	}
 }

@@ -59,8 +59,8 @@ var modelProviders = map[string]string{
 	"Anthropic": "Anthropic Claude",
 }
 
-// providerOrder defines the display order for providers
-var providerOrder = []string{"Google Gemini", "Anthropic Claude", "OpenAI", "Other"}
+// providerOrder defines the display order for providers (sorted alphabetically)
+var providerOrder = []string{"Anthropic Claude", "Google Gemini", "OpenAI", "Other"}
 
 // GetModelDisplayName returns a display name for a model
 func GetModelDisplayName(modelID, displayName string) string {
